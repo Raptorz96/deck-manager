@@ -1,0 +1,42 @@
+# File di configurazione Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Ambiente virtuale
+venv/
+ENV/
+
+# Flask
+instance/
+.webassets-cache
+
+# File di database
+data/deck.json
+
+# File di sistema
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# File temporanei
+*.log
+*.tmp
