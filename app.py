@@ -4,7 +4,8 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
 from dataclasses import dataclass, field
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+import streamlit as st
+import pandas as pd
 
 # Configurazione del logging
 logging.basicConfig(
@@ -52,10 +53,6 @@ class Deck:
             name=data["name"],
             cards=[Card.from_dict(card) for card in data.get("cards", [])]
         )
-
-app = Flask(__name__)
-# Usa variabili d'ambiente per la configurazione
-app.secret_key = os.environ.get('SECRET_KEY', 'deck_manager_secret_key')  # Meglio usare variabili d'ambiente
 
 # Costanti
 DATA_FOLDER = Path(__file__).parent / 'data'
@@ -154,174 +151,180 @@ def export_deck_to_file(deck: Deck) -> str:
     
     return content
 
-@app.route('/')
-def index():
-    """Pagina principale che mostra il deck corrente."""
+def main():
+    st.set_page_config(
+        page_title="Deck Manager",
+        page_icon="🃏",
+        layout="wide"
+    )
+    
+    st.title("Deck Manager")
+    
+    # Carica il deck
     deck = load_deck()
     
-    # Calcola statistiche
+    # Sidebar
+    with st.sidebar:
+        st.header("Menu")
+        
+        # Rinomina deck
+        with st.form("rename_deck_form"):
+            st.subheader("Rinomina Deck")
+            new_name = st.text_input("Nuovo nome", value=deck.name)
+            rename_submit = st.form_submit_button("Rinomina")
+            
+            if rename_submit and new_name.strip():
+                deck.name = new_name.strip()
+                save_deck(deck)
+                st.success("Deck rinominato con successo")
+                st.rerun()
+        
+        # Upload deck
+        st.subheader("Importa Deck")
+        uploaded_file = st.file_uploader("Carica un file .deck", type=["deck"])
+        if uploaded_file is not None:
+            try:
+                file_content = uploaded_file.getvalue().decode('utf-8')
+                deck = import_deck_from_file(file_content)
+                save_deck(deck)
+                st.success("Deck importato con successo!")
+                st.rerun()
+            except UnicodeDecodeError:
+                st.error("Il file non è in formato UTF-8 valido")
+            except Exception as e:
+                logger.error(f"Errore durante l'importazione del deck: {str(e)}")
+                st.error(f"Errore durante l'importazione: {str(e)}")
+        
+        # Download deck
+        st.subheader("Esporta Deck")
+        content = export_deck_to_file(deck)
+        st.download_button(
+            label="Scarica deck",
+            data=content,
+            file_name=f"{deck.name.replace(' ', '_')}.deck",
+            mime="text/plain"
+        )
+        
+        # Svuota deck
+        if st.button("Svuota Deck"):
+            if st.session_state.get('confirm_clear', False):
+                deck.cards = []
+                save_deck(deck)
+                st.success("Deck svuotato con successo")
+                st.session_state.confirm_clear = False
+                st.rerun()
+            else:
+                st.session_state.confirm_clear = True
+                st.warning("Sei sicuro di voler svuotare il deck? Clicca di nuovo per confermare.")
+    
+    # Contenuto principale
+    st.header(f"Deck: {deck.name}")
+    
+    # Statistiche
     total_cards = sum(card.quantity for card in deck.cards)
     unique_cards = len(deck.cards)
     
-    return render_template('index.html', 
-                          deck=deck.to_dict(), 
-                          total_cards=total_cards, 
-                          unique_cards=unique_cards)
-
-@app.route('/upload', methods=['POST'])
-def upload_deck():
-    """Gestisce l'upload di un file .deck."""
-    if 'deck_file' not in request.files:
-        flash('Nessun file selezionato', 'error')
-        return redirect(url_for('index'))
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Carte totali", total_cards)
+    with col2:
+        st.metric("Carte uniche", unique_cards)
     
-    file = request.files['deck_file']
-    
-    if file.filename == '':
-        flash('Nessun file selezionato', 'error')
-        return redirect(url_for('index'))
-    
-    # Verifica la dimensione del file (max 5MB)
-    if len(file.read()) > 5 * 1024 * 1024:
-        flash('Il file è troppo grande (max 5MB)', 'error')
-        return redirect(url_for('index'))
-    
-    # Riavvolgi il file per poterlo leggere di nuovo
-    file.seek(0)
-    
-    if file and file.filename.endswith('.deck'):
-        try:
-            file_content = file.read().decode('utf-8')
-            deck = import_deck_from_file(file_content)
-            save_deck(deck)
-            flash('Deck importato con successo!', 'success')
-        except UnicodeDecodeError:
-            flash('Il file non è in formato UTF-8 valido', 'error')
-        except Exception as e:
-            logger.error(f"Errore durante l'importazione del deck: {str(e)}")
-            flash(f'Errore durante l\'importazione: {str(e)}', 'error')
-    else:
-        flash('Il file deve avere estensione .deck', 'error')
-    
-    return redirect(url_for('index'))
-
-@app.route('/download')
-def download_deck():
-    """Scarica il deck come file .deck."""
-    deck = load_deck()
-    content = export_deck_to_file(deck)
-    
-    return jsonify({
-        "content": content,
-        "filename": f"{deck.name.replace(' ', '_')}.deck"
-    })
-
-@app.route('/add_card', methods=['POST'])
-def add_card():
-    """Aggiunge una carta al deck."""
-    deck = load_deck()
-    
-    name = request.form.get('card_name', '').strip()
-    card_type = request.form.get('card_type', '').strip()
-    
-    try:
-        quantity = int(request.form.get('quantity', 1))
-        if quantity <= 0:
-            raise ValueError("La quantità deve essere positiva")
-    except ValueError:
-        flash('La quantità deve essere un numero positivo', 'error')
-        return redirect(url_for('index'))
-    
-    if not name:
-        flash('Il nome della carta non può essere vuoto', 'error')
-        return redirect(url_for('index'))
-    
-    # Controlla se la carta esiste già
-    for card in deck.cards:
-        if card.name.lower() == name.lower() and card.type.lower() == card_type.lower():
-            card.quantity += quantity
-            save_deck(deck)
-            flash(f'Aggiunte {quantity} copie di {name}', 'success')
-            return redirect(url_for('index'))
-    
-    # Aggiungi la nuova carta
-    deck.cards.append(Card(
-        name=name,
-        type=card_type,
-        quantity=quantity
-    ))
-    
-    save_deck(deck)
-    flash(f'Aggiunte {quantity} copie di {name}', 'success')
-    return redirect(url_for('index'))
-
-@app.route('/remove_card/<int:index>', methods=['POST'])
-def remove_card(index: int):
-    """Rimuove una carta dal deck."""
-    deck = load_deck()
-    
-    if 0 <= index < len(deck.cards):
-        card = deck.cards[index]
-        try:
-            quantity = int(request.form.get('quantity', 1))
-            if quantity <= 0:
-                raise ValueError("La quantità deve essere positiva")
-        except ValueError:
-            flash('La quantità deve essere un numero positivo', 'error')
-            return redirect(url_for('index'))
+    # Aggiungi carta
+    with st.form("add_card_form"):
+        st.subheader("Aggiungi Carta")
         
-        if quantity >= card.quantity:
-            # Rimuovi completamente la carta
-            removed_card = deck.cards.pop(index)
-            flash(f'Rimossa {removed_card.name}', 'success')
-        else:
-            # Riduci la quantità
-            card.quantity -= quantity
-            flash(f'Rimosse {quantity} copie di {card.name}', 'success')
+        add_col1, add_col2, add_col3 = st.columns([3, 2, 1])
         
-        save_deck(deck)
+        with add_col1:
+            card_name = st.text_input("Nome della carta")
+        
+        with add_col2:
+            card_type = st.text_input("Tipo (Set)")
+        
+        with add_col3:
+            quantity = st.number_input("Quantità", min_value=1, value=1, step=1)
+        
+        add_card_submit = st.form_submit_button("Aggiungi")
+        
+        if add_card_submit:
+            if not card_name.strip():
+                st.error("Il nome della carta non può essere vuoto")
+            else:
+                # Controlla se la carta esiste già
+                found = False
+                for card in deck.cards:
+                    if card.name.lower() == card_name.lower() and card.type.lower() == card_type.lower():
+                        card.quantity += quantity
+                        found = True
+                        save_deck(deck)
+                        st.success(f"Aggiunte {quantity} copie di {card_name}")
+                        break
+                
+                if not found:
+                    # Aggiungi la nuova carta
+                    deck.cards.append(Card(
+                        name=card_name,
+                        type=card_type,
+                        quantity=quantity
+                    ))
+                    save_deck(deck)
+                    st.success(f"Aggiunte {quantity} copie di {card_name}")
+                
+                st.rerun()
+    
+    # Tabella delle carte
+    if deck.cards:
+        st.subheader("Carte nel deck")
+        
+        cards_data = [{
+            "Indice": i,
+            "Nome": card.name,
+            "Tipo": card.type,
+            "Quantità": card.quantity
+        } for i, card in enumerate(deck.cards)]
+        
+        df = pd.DataFrame(cards_data)
+        
+        # Modifica la tabella per aggiungere il bottone di rimozione
+        st.dataframe(
+            df.drop(columns=["Indice"]),
+            hide_index=True
+        )
+        
+        # Form per rimuovere carte
+        with st.form("remove_card_form"):
+            st.subheader("Rimuovi Carta")
+            
+            remove_col1, remove_col2 = st.columns([3, 1])
+            
+            with remove_col1:
+                card_options = [f"{card.name} {card.type}" for card in deck.cards]
+                selected_card = st.selectbox("Seleziona una carta", options=card_options)
+            
+            with remove_col2:
+                card_index = card_options.index(selected_card)
+                max_quantity = deck.cards[card_index].quantity
+                remove_quantity = st.number_input("Quantità da rimuovere", min_value=1, max_value=max_quantity, value=1, step=1)
+            
+            remove_submit = st.form_submit_button("Rimuovi")
+            
+            if remove_submit:
+                if 0 <= card_index < len(deck.cards):
+                    card = deck.cards[card_index]
+                    if remove_quantity >= card.quantity:
+                        # Rimuovi completamente la carta
+                        removed_card = deck.cards.pop(card_index)
+                        st.success(f"Rimossa {removed_card.name}")
+                    else:
+                        # Riduci la quantità
+                        card.quantity -= remove_quantity
+                        st.success(f"Rimosse {remove_quantity} copie di {card.name}")
+                    
+                    save_deck(deck)
+                    st.rerun()
     else:
-        flash('Carta non trovata', 'error')
-    
-    return redirect(url_for('index'))
-
-@app.route('/rename_deck', methods=['POST'])
-def rename_deck():
-    """Rinomina il deck."""
-    deck = load_deck()
-    
-    new_name = request.form.get('deck_name', '').strip()
-    if new_name:
-        deck.name = new_name
-        save_deck(deck)
-        flash('Deck rinominato con successo', 'success')
-    else:
-        flash('Il nome del deck non può essere vuoto', 'error')
-    
-    return redirect(url_for('index'))
-
-@app.route('/clear_deck', methods=['POST'])
-def clear_deck():
-    """Svuota completamente il deck."""
-    deck = load_deck()
-    deck.cards = []
-    save_deck(deck)
-    flash('Deck svuotato con successo', 'success')
-    return redirect(url_for('index'))
-
-# Gestione degli errori
-@app.errorhandler(404)
-def page_not_found(e):
-    return render_template('index.html', error="Pagina non trovata"), 404
-
-@app.errorhandler(500)
-def server_error(e):
-    logger.error(f"Errore del server: {str(e)}")
-    return render_template('index.html', error="Errore interno del server"), 500
+        st.info("Il deck è vuoto. Aggiungi delle carte!")
 
 if __name__ == '__main__':
-    # Usa variabili d'ambiente per configurare la modalità debug
-    debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    # Usa porta 5001 per evitare conflitti con altre applicazioni
-    port = int(os.environ.get('PORT', 5001))
-    app.run(debug=debug_mode, port=port)
+    main()
