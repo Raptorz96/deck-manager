@@ -322,4 +322,6 @@ def server_error(e):
 if __name__ == '__main__':
     # Usa variabili d'ambiente per configurare la modalità debug
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    app.run(debug=debug_mode)
+    # Usa porta 5001 per evitare conflitti con altre applicazioni
+    port = int(os.environ.get('PORT', 5001))
+    app.run(debug=debug_mode, port=port)
