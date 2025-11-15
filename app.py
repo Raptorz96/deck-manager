@@ -1,3 +1,7 @@
+"""
+Magic: The Gathering Commander Deck Synergy Analyzer
+Analizza la tua collezione e raccomanda carte basate su mazzi precon Commander
+"""
 import json
 import os
 import logging
@@ -7,6 +11,11 @@ from dataclasses import dataclass, field
 import streamlit as st
 import pandas as pd
 
+from scryfall_api import get_scryfall_api
+from commander_precons import get_precon_database, CommanderPrecon
+from synergy_analyzer import get_synergy_analyzer
+from recommendation_engine import get_recommendation_engine
+
 # Configurazione del logging
 logging.basicConfig(
     level=logging.INFO,
@@ -14,317 +23,414 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configurazione pagina
+st.set_page_config(
+    page_title="MTG Commander Synergy Analyzer",
+    page_icon="🃏",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# CSS personalizzato
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #FF6B6B;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        color: #4ECDC4;
+        margin-bottom: 1rem;
+    }
+    .card-recommendation {
+        background-color: #f0f2f6;
+        border-radius: 10px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+    }
+    .priority-high {
+        border-left: 5px solid #ff4444;
+    }
+    .priority-medium {
+        border-left: 5px solid #ffaa00;
+    }
+    .priority-low {
+        border-left: 5px solid #44ff44;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Costanti
+DATA_FOLDER = Path(__file__).parent / 'data'
+COLLECTION_FILE = DATA_FOLDER / 'collection.json'
+
+# Assicurati che la cartella data esista
+DATA_FOLDER.mkdir(exist_ok=True)
+
+
 # Definizione delle strutture dati
 @dataclass
 class Card:
     name: str
-    type: str = ""
     quantity: int = 1
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
-            "type": self.type,
             "quantity": self.quantity
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Card':
         return cls(
             name=data["name"],
-            type=data.get("type", ""),
             quantity=data.get("quantity", 1)
         )
 
+
 @dataclass
-class Deck:
-    name: str = "Nuovo Deck"
+class Collection:
+    name: str = "La Mia Collezione"
     cards: List[Card] = field(default_factory=list)
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "cards": [card.to_dict() for card in self.cards]
         }
-    
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'Deck':
+    def from_dict(cls, data: Dict[str, Any]) -> 'Collection':
         return cls(
             name=data["name"],
             cards=[Card.from_dict(card) for card in data.get("cards", [])]
         )
 
-# Costanti
-DATA_FOLDER = Path(__file__).parent / 'data'
-DECK_FILE = DATA_FOLDER / 'deck.json'
 
-# Assicurati che la cartella data esista
-DATA_FOLDER.mkdir(exist_ok=True)
+def load_collection() -> Collection:
+    """Carica la collezione dal file JSON"""
+    if not COLLECTION_FILE.exists():
+        empty = Collection()
+        save_collection(empty)
+        return empty
 
-# Struttura di un deck vuoto
-EMPTY_DECK = Deck()
-
-def load_deck() -> Deck:
-    """Carica il deck dal file JSON."""
-    if not DECK_FILE.exists():
-        # Se il file non esiste, crea un deck vuoto
-        with open(DECK_FILE, 'w') as f:
-            json.dump(EMPTY_DECK.to_dict(), f, indent=4)
-        return EMPTY_DECK
-    
     try:
-        with open(DECK_FILE, 'r') as f:
+        with open(COLLECTION_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        return Deck.from_dict(data)
-    except json.JSONDecodeError:
-        # Se il file è danneggiato, crea un nuovo deck
-        logger.warning(f"File JSON danneggiato. Creazione di un nuovo deck.")
-        with open(DECK_FILE, 'w') as f:
-            json.dump(EMPTY_DECK.to_dict(), f, indent=4)
-        return EMPTY_DECK
+        return Collection.from_dict(data)
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.error(f"Errore nel caricamento della collezione: {e}")
+        empty = Collection()
+        save_collection(empty)
+        return empty
 
-def save_deck(deck: Deck) -> None:
-    """Salva il deck nel file JSON."""
-    with open(DECK_FILE, 'w') as f:
-        json.dump(deck.to_dict(), f, indent=4)
 
-def import_deck_from_file(file_content: str) -> Deck:
-    """Importa un deck da un file .deck."""
-    deck = Deck(name="Deck Importato")
-    
-    # Analizza il file .deck riga per riga
+def save_collection(collection: Collection) -> None:
+    """Salva la collezione nel file JSON"""
+    with open(COLLECTION_FILE, 'w', encoding='utf-8') as f:
+        json.dump(collection.to_dict(), f, indent=2, ensure_ascii=False)
+
+
+def import_collection_from_file(file_content: str) -> Collection:
+    """Importa una collezione da un file .deck"""
+    collection = Collection(name="Collezione Importata")
+
     lines = file_content.strip().split('\n')
     for line in lines:
         line = line.strip()
-        if not line or line.startswith('#'):  # Ignora linee vuote e commenti
+        if not line or line.startswith('#'):
             continue
-        
-        # Formato tipico: "2 Carta Esempio (SET123)"
+
         parts = line.split(' ', 1)
         if len(parts) == 2:
             try:
                 quantity = int(parts[0])
-                card_name = parts[1]
-                
-                # Estrai il set se presente
-                card_type = ""
-                if '(' in card_name and ')' in card_name:
-                    end_idx = card_name.rfind('(')
-                    card_type = card_name[end_idx:].strip()
-                    card_name = card_name[:end_idx].strip()
-                
-                deck.cards.append(Card(
-                    name=card_name,
-                    type=card_type,
-                    quantity=quantity
-                ))
+                card_name = parts[1].split('(')[0].strip()  # Rimuovi info set
+                collection.cards.append(Card(name=card_name, quantity=quantity))
             except ValueError:
-                # Se la prima parte non è un numero, considera l'intera riga come nome
-                deck.cards.append(Card(
-                    name=line,
-                    type="",
-                    quantity=1
-                ))
+                collection.cards.append(Card(name=line, quantity=1))
         else:
-            # Se non c'è uno spazio, considerala come una singola carta
-            deck.cards.append(Card(
-                name=line,
-                type="",
-                quantity=1
-            ))
-    
-    return deck
+            collection.cards.append(Card(name=line, quantity=1))
 
-def export_deck_to_file(deck: Deck) -> str:
-    """Esporta un deck nel formato .deck."""
-    content = f"# {deck.name}\n\n"
-    
-    for card in deck.cards:
-        name = card.name
-        card_type = card.type
-        quantity = card.quantity
-        
-        if card_type:
-            content += f"{quantity} {name} {card_type}\n"
-        else:
-            content += f"{quantity} {name}\n"
-    
-    return content
+    return collection
+
 
 def main():
-    st.set_page_config(
-        page_title="Deck Manager",
-        page_icon="🃏",
-        layout="wide"
-    )
-    
-    st.title("Deck Manager")
-    
-    # Carica il deck
-    deck = load_deck()
-    
+    # Header
+    st.markdown('<div class="main-header">🃏 Magic: The Gathering Commander Synergy Analyzer</div>', unsafe_allow_html=True)
+    st.markdown("**Analizza la tua collezione e scopri quali mazzi precon Commander sono perfetti per te!**")
+
+    # Inizializza servizi
+    scryfall = get_scryfall_api()
+    precon_db = get_precon_database()
+    analyzer = get_synergy_analyzer()
+    recommender = get_recommendation_engine()
+
+    # Carica collezione
+    if 'collection' not in st.session_state:
+        st.session_state.collection = load_collection()
+
+    collection = st.session_state.collection
+
     # Sidebar
     with st.sidebar:
-        st.header("Menu")
-        
-        # Rinomina deck
-        with st.form("rename_deck_form"):
-            st.subheader("Rinomina Deck")
-            new_name = st.text_input("Nuovo nome", value=deck.name)
-            rename_submit = st.form_submit_button("Rinomina")
-            
-            if rename_submit and new_name.strip():
-                deck.name = new_name.strip()
-                save_deck(deck)
-                st.success("Deck rinominato con successo")
-                st.rerun()
-        
-        # Upload deck
-        st.subheader("Importa Deck")
-        uploaded_file = st.file_uploader("Carica un file .deck", type=["deck"])
-        if uploaded_file is not None:
+        st.header("📚 Gestione Collezione")
+
+        # Rinomina collezione
+        with st.expander("✏️ Rinomina Collezione"):
+            new_name = st.text_input("Nuovo nome", value=collection.name)
+            if st.button("Rinomina", key="rename_btn"):
+                collection.name = new_name
+                save_collection(collection)
+                st.success("Collezione rinominata!")
+
+        # Import/Export
+        st.subheader("📥 Importa Collezione")
+        uploaded_file = st.file_uploader("Carica file .deck o .txt", type=["deck", "txt"])
+        if uploaded_file:
             try:
                 file_content = uploaded_file.getvalue().decode('utf-8')
-                deck = import_deck_from_file(file_content)
-                save_deck(deck)
-                st.success("Deck importato con successo!")
+                collection = import_collection_from_file(file_content)
+                st.session_state.collection = collection
+                save_collection(collection)
+                st.success(f"✅ Importate {len(collection.cards)} carte!")
                 st.rerun()
-            except UnicodeDecodeError:
-                st.error("Il file non è in formato UTF-8 valido")
             except Exception as e:
-                logger.error(f"Errore durante l'importazione del deck: {str(e)}")
-                st.error(f"Errore durante l'importazione: {str(e)}")
-        
-        # Download deck
-        st.subheader("Esporta Deck")
-        content = export_deck_to_file(deck)
-        st.download_button(
-            label="Scarica deck",
-            data=content,
-            file_name=f"{deck.name.replace(' ', '_')}.deck",
-            mime="text/plain"
-        )
-        
-        # Svuota deck
-        if st.button("Svuota Deck"):
-            if st.session_state.get('confirm_clear', False):
-                deck.cards = []
-                save_deck(deck)
-                st.success("Deck svuotato con successo")
-                st.session_state.confirm_clear = False
-                st.rerun()
-            else:
-                st.session_state.confirm_clear = True
-                st.warning("Sei sicuro di voler svuotare il deck? Clicca di nuovo per confermare.")
-    
-    # Contenuto principale
-    st.header(f"Deck: {deck.name}")
-    
-    # Statistiche
-    total_cards = sum(card.quantity for card in deck.cards)
-    unique_cards = len(deck.cards)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Carte totali", total_cards)
-    with col2:
-        st.metric("Carte uniche", unique_cards)
-    
-    # Aggiungi carta
-    with st.form("add_card_form"):
-        st.subheader("Aggiungi Carta")
-        
-        add_col1, add_col2, add_col3 = st.columns([3, 2, 1])
-        
-        with add_col1:
-            card_name = st.text_input("Nome della carta")
-        
-        with add_col2:
-            card_type = st.text_input("Tipo (Set)")
-        
-        with add_col3:
+                st.error(f"❌ Errore nell'importazione: {e}")
+
+        # Aggiungi carta manualmente
+        st.subheader("➕ Aggiungi Carta")
+        with st.form("add_card_form"):
+            card_name = st.text_input("Nome carta")
             quantity = st.number_input("Quantità", min_value=1, value=1, step=1)
-        
-        add_card_submit = st.form_submit_button("Aggiungi")
-        
-        if add_card_submit:
-            if not card_name.strip():
-                st.error("Il nome della carta non può essere vuoto")
-            else:
-                # Controlla se la carta esiste già
-                found = False
-                for card in deck.cards:
-                    if card.name.lower() == card_name.lower() and card.type.lower() == card_type.lower():
-                        card.quantity += quantity
-                        found = True
-                        save_deck(deck)
-                        st.success(f"Aggiunte {quantity} copie di {card_name}")
-                        break
-                
-                if not found:
-                    # Aggiungi la nuova carta
-                    deck.cards.append(Card(
-                        name=card_name,
-                        type=card_type,
-                        quantity=quantity
-                    ))
-                    save_deck(deck)
-                    st.success(f"Aggiunte {quantity} copie di {card_name}")
-                
-                st.rerun()
-    
-    # Tabella delle carte
-    if deck.cards:
-        st.subheader("Carte nel deck")
-        
-        cards_data = [{
-            "Indice": i,
-            "Nome": card.name,
-            "Tipo": card.type,
-            "Quantità": card.quantity
-        } for i, card in enumerate(deck.cards)]
-        
-        df = pd.DataFrame(cards_data)
-        
-        # Modifica la tabella per aggiungere il bottone di rimozione
-        st.dataframe(
-            df.drop(columns=["Indice"]),
-            hide_index=True
-        )
-        
-        # Form per rimuovere carte
-        with st.form("remove_card_form"):
-            st.subheader("Rimuovi Carta")
-            
-            remove_col1, remove_col2 = st.columns([3, 1])
-            
-            with remove_col1:
-                card_options = [f"{card.name} {card.type}" for card in deck.cards]
-                selected_card = st.selectbox("Seleziona una carta", options=card_options)
-            
-            with remove_col2:
-                card_index = card_options.index(selected_card)
-                max_quantity = deck.cards[card_index].quantity
-                remove_quantity = st.number_input("Quantità da rimuovere", min_value=1, max_value=max_quantity, value=1, step=1)
-            
-            remove_submit = st.form_submit_button("Rimuovi")
-            
-            if remove_submit:
-                if 0 <= card_index < len(deck.cards):
-                    card = deck.cards[card_index]
-                    if remove_quantity >= card.quantity:
-                        # Rimuovi completamente la carta
-                        removed_card = deck.cards.pop(card_index)
-                        st.success(f"Rimossa {removed_card.name}")
-                    else:
-                        # Riduci la quantità
-                        card.quantity -= remove_quantity
-                        st.success(f"Rimosse {remove_quantity} copie di {card.name}")
-                    
-                    save_deck(deck)
+
+            if st.form_submit_button("Aggiungi"):
+                if card_name.strip():
+                    # Verifica se esiste
+                    found = False
+                    for card in collection.cards:
+                        if card.name.lower() == card_name.lower():
+                            card.quantity += quantity
+                            found = True
+                            break
+
+                    if not found:
+                        collection.cards.append(Card(name=card_name, quantity=quantity))
+
+                    save_collection(collection)
+                    st.success(f"✅ Aggiunte {quantity}x {card_name}")
                     st.rerun()
-    else:
-        st.info("Il deck è vuoto. Aggiungi delle carte!")
+
+        # Statistiche rapide
+        st.divider()
+        st.metric("Carte totali", sum(c.quantity for c in collection.cards))
+        st.metric("Carte uniche", len(collection.cards))
+
+    # Tab principali
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🏠 Collezione",
+        "🎯 Precon Raccomandati",
+        "💎 Raccomandazioni Carte",
+        "📊 Analisi Dettagliata"
+    ])
+
+    # TAB 1: Collezione
+    with tab1:
+        st.header(f"📦 {collection.name}")
+
+        if collection.cards:
+            # Crea DataFrame
+            df = pd.DataFrame([
+                {"Nome": card.name, "Quantità": card.quantity}
+                for card in collection.cards
+            ])
+
+            # Mostra tabella
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Rimuovi carta
+            with st.expander("🗑️ Rimuovi Carte"):
+                card_to_remove = st.selectbox(
+                    "Seleziona carta da rimuovere",
+                    options=[f"{c.name} (x{c.quantity})" for c in collection.cards]
+                )
+
+                if st.button("Rimuovi", key="remove_btn"):
+                    idx = [f"{c.name} (x{c.quantity})" for c in collection.cards].index(card_to_remove)
+                    collection.cards.pop(idx)
+                    save_collection(collection)
+                    st.success("Carta rimossa!")
+                    st.rerun()
+        else:
+            st.info("📭 La tua collezione è vuota. Aggiungi carte dalla sidebar!")
+
+    # TAB 2: Precon Raccomandati
+    with tab2:
+        st.header("🎯 Mazzi Precon Commander Raccomandati")
+
+        if not collection.cards:
+            st.warning("⚠️ Aggiungi carte alla collezione per vedere i precon raccomandati!")
+        else:
+            with st.spinner("🔍 Analizzo le sinergie..."):
+                card_names = [card.name for card in collection.cards]
+                all_precons = precon_db.get_all_precons()
+
+                recommended_precons = analyzer.recommend_precons_for_cards(
+                    card_names,
+                    all_precons,
+                    top_n=5
+                )
+
+                if recommended_precons:
+                    st.success(f"✅ Trovati {len(recommended_precons)} precon compatibili!")
+
+                    for idx, (precon, stats) in enumerate(recommended_precons, 1):
+                        with st.expander(
+                            f"#{idx} - {precon.name} ({precon.year}) - "
+                            f"{stats['total_cards']} carte compatibili "
+                            f"(Score medio: {stats['avg_score']:.1f}/100)",
+                            expanded=(idx == 1)
+                        ):
+                            col1, col2 = st.columns([1, 1])
+
+                            with col1:
+                                st.markdown(f"**Commander:** {', '.join(precon.commanders)}")
+                                st.markdown(f"**Colori:** {', '.join(precon.color_identity) if precon.color_identity else 'Colorless'}")
+                                st.markdown(f"**Archetipo:** {precon.archetype}")
+                                st.markdown(f"**Temi:** {', '.join(precon.themes)}")
+                                st.markdown(f"**Descrizione:** {precon.description}")
+
+                            with col2:
+                                st.metric("Carte Compatibili", stats['total_cards'])
+                                st.metric("Score Medio", f"{stats['avg_score']:.1f}/100")
+                                st.metric("Score Massimo", f"{stats['max_score']:.1f}/100")
+
+                            # Top carte
+                            st.markdown("**🌟 Le tue migliori carte per questo precon:**")
+                            for card_score in stats['top_cards'][:5]:
+                                st.markdown(
+                                    f"- **{card_score.card_name}** ({card_score.score:.1f}/100): "
+                                    f"{', '.join(card_score.reasons[:2])}"
+                                )
+                else:
+                    st.warning("⚠️ Nessun precon trovato compatibile con la tua collezione.")
+
+    # TAB 3: Raccomandazioni Carte
+    with tab3:
+        st.header("💎 Carte Raccomandate da Aggiungere")
+
+        if not collection.cards:
+            st.warning("⚠️ Aggiungi carte alla collezione per vedere le raccomandazioni!")
+        else:
+            with st.spinner("🔮 Generazione raccomandazioni..."):
+                card_names = [card.name for card in collection.cards]
+                recommendations = recommender.get_recommendations_for_collection(
+                    card_names,
+                    top_precons=3,
+                    cards_per_precon=10
+                )
+
+                if recommendations:
+                    for precon_name, recs in recommendations.items():
+                        st.subheader(f"📖 {precon_name}")
+
+                        for rec in recs:
+                            priority_class = f"priority-{rec.priority}"
+                            priority_emoji = {
+                                'high': '🔴',
+                                'medium': '🟡',
+                                'low': '🟢'
+                            }[rec.priority]
+
+                            with st.container():
+                                st.markdown(
+                                    f'<div class="card-recommendation {priority_class}">',
+                                    unsafe_allow_html=True
+                                )
+
+                                col1, col2 = st.columns([3, 1])
+
+                                with col1:
+                                    st.markdown(f"### {priority_emoji} {rec.card_name}")
+                                    st.markdown(f"**Score:** {rec.score:.1f}/100")
+                                    st.markdown(f"**Motivi:**")
+                                    for reason in rec.reasons:
+                                        st.markdown(f"- {reason}")
+
+                                    if rec.is_key_card:
+                                        st.markdown("⭐ **CARTA CHIAVE DEL PRECON**")
+
+                                with col2:
+                                    card_details = rec.card_details
+                                    if card_details.get('image_uri'):
+                                        st.image(card_details['image_uri'], width=200)
+
+                                    if card_details.get('scryfall_uri'):
+                                        st.markdown(f"[🔗 Vedi su Scryfall]({card_details['scryfall_uri']})")
+
+                                st.markdown('</div>', unsafe_allow_html=True)
+
+                        st.divider()
+                else:
+                    st.info("ℹ️ Nessuna raccomandazione disponibile.")
+
+    # TAB 4: Analisi Dettagliata
+    with tab4:
+        st.header("📊 Analisi Dettagliata")
+
+        if not collection.cards:
+            st.warning("⚠️ Aggiungi carte alla collezione per vedere l'analisi!")
+        else:
+            # Seleziona un precon per analisi approfondita
+            all_precons = precon_db.get_all_precons()
+            precon_names = [p.name for p in all_precons]
+
+            selected_precon_name = st.selectbox(
+                "Seleziona un precon da analizzare in dettaglio",
+                options=precon_names
+            )
+
+            selected_precon = next(p for p in all_precons if p.name == selected_precon_name)
+
+            if st.button("🔍 Analizza Lacune", key="analyze_btn"):
+                with st.spinner("Analisi in corso..."):
+                    card_names = [card.name for card in collection.cards]
+                    gaps = recommender.analyze_collection_gaps(card_names, selected_precon)
+
+                    st.subheader(f"Analisi per: {selected_precon.name}")
+
+                    # Carte chiave mancanti
+                    st.markdown("### 🔑 Carte Chiave Mancanti")
+                    if gaps['missing_key_cards']:
+                        for card in gaps['missing_key_cards']:
+                            st.markdown(f"- ❌ {card}")
+                    else:
+                        st.success("✅ Hai tutte le carte chiave!")
+
+                    # Copertura temi
+                    st.markdown("### 🎨 Copertura Temi")
+                    for theme, data in gaps['theme_coverage'].items():
+                        coverage = data['coverage_percent']
+                        supporting = data['supporting_cards']
+
+                        st.progress(coverage / 100)
+                        st.markdown(
+                            f"**{theme.capitalize()}**: {coverage:.1f}% "
+                            f"({supporting} carte nella collezione)"
+                        )
+
+                    # Top raccomandazioni
+                    st.markdown("### ⭐ Top Raccomandazioni")
+                    for rec in gaps['recommendations'][:5]:
+                        st.markdown(
+                            f"**{rec.card_name}** ({rec.priority.upper()}): "
+                            f"{rec.score:.1f}/100"
+                        )
+
 
 if __name__ == '__main__':
     main()
